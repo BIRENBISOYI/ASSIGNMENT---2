@@ -1,0 +1,263 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split, TimeSeriesSplit, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score, roc_curve, auc
+from sklearn.metrics import make_scorer
+import warnings
+warnings.filterwarnings("ignore")
+RANDOM_STATE = 42
+
+# ---------------- USER SETTINGS ----------------
+DATA_PATH = "/content/loan_data.csv"   # after upload
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+MIN_GROUP_SIZE = 30   # min samples to include a loan_purpose in top/bottom lists
+# -----------------------------------------------
+
+# Upload if file not present
+if not os.path.exists(DATA_PATH):
+    print("Please upload loan_data.csv (file-picker will open).")
+    from google.colab import files
+    uploaded = files.upload()
+    if len(uploaded) == 0:
+        raise FileNotFoundError("No file uploaded.")
+    # Move first uploaded file to DATA_PATH (or expect exact name)
+    uploaded_name = list(uploaded.keys())[0]
+    if uploaded_name != os.path.basename(DATA_PATH):
+        os.rename(uploaded_name, DATA_PATH)
+    print("Uploaded to", DATA_PATH)
+
+# Load dataset
+df = pd.read_csv(DATA_PATH)
+print("Loaded shape:", df.shape)
+print("Columns:", df.columns.tolist())
+display(df.head())
+
+# Basic sanity: target distribution
+if 'loan_paid_back' not in df.columns:
+    raise ValueError("Target column 'loan_paid_back' not found in data.")
+print("Target distribution:\n", df['loan_paid_back'].value_counts(normalize=False))
+
+# Identify feature types
+# Numerical columns we expect (but check existence)
+num_cols = [c for c in ['annual_income', 'debt_to_income_ratio', 'credit_score', 'loan_amount', 'interest_rate'] if c in df.columns]
+cat_cols = [c for c in ['gender', 'marital_status', 'education_level', 'employment_status', 'loan_purpose', 'grade', 'subgrade'] if c in df.columns]
+print("Numerical cols:", num_cols)
+print("Categorical cols:", cat_cols)
+
+# Drop id column
+if 'id' in df.columns:
+    df = df.drop(columns=['id'])
+
+# Split into train/test (stratify by target)
+train_df, test_df = train_test_split(df, test_size=TEST_SIZE, stratify=df['loan_paid_back'], random_state=RANDOM_STATE)
+print("Train/test sizes:", train_df.shape, test_df.shape)
+
+# ---------------- Preprocessing pipeline ----------------
+# Build OneHotEncoder with compatibility for sklearn versions (sparse_output or sparse)
+ohe_kwargs = {'handle_unknown': 'ignore'}
+try:
+    # try new argument name
+    OneHotEncoder(sparse_output=False, **ohe_kwargs)
+    ohe = OneHotEncoder(sparse_output=False, **ohe_kwargs)
+    print("Using OneHotEncoder(sparse_output=False)")
+except TypeError:
+    ohe = OneHotEncoder(sparse=False, **ohe_kwargs)
+    print("Using OneHotEncoder(sparse=False)")
+
+numeric_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+categorical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='constant', fill_value='MISSING')),
+    ('onehot', ohe)
+])
+
+preprocessor = ColumnTransformer(transformers=[
+    ('num', numeric_transformer, num_cols),
+    ('cat', categorical_transformer, cat_cols)
+], remainder='drop')
+
+# ---------------- Model pipelines & hyperparameter grids ----------------
+lr_pipe = Pipeline(steps=[
+    ('preproc', preprocessor),
+    ('clf', LogisticRegression(solver='saga', max_iter=2000, random_state=RANDOM_STATE))
+])
+
+rf_pipe = Pipeline(steps=[
+    ('preproc', preprocessor),
+    ('clf', RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1))
+])
+
+# Small grids for fast tune in Colab; extend if more time available
+lr_grid = {
+    'clf__C': [0.01, 0.1, 1.0],
+    'clf__class_weight': [None, 'balanced']
+}
+
+rf_grid = {
+    'clf__n_estimators': [100],
+    'clf__max_depth': [6, 12, None],
+    'clf__min_samples_leaf': [1, 5],
+    'clf__class_weight': [None, 'balanced']
+}
+
+# Use ROC AUC as scoring
+from sklearn.metrics import roc_auc_score
+scorer = make_scorer(roc_auc_score, needs_proba=True)
+
+# TimeSeriesSplit isn't necessary; simple CV is fine here
+from sklearn.model_selection import StratifiedKFold
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+# Fit LR
+print("Tuning Logistic Regression...")
+lr_search = GridSearchCV(lr_pipe, lr_grid, scoring=scorer, cv=cv, n_jobs=1, verbose=1)
+lr_search.fit(train_df[num_cols + cat_cols], train_df['loan_paid_back'])
+print("LR best params:", lr_search.best_params_, "best CV AUC:", lr_search.best_score_)
+
+# Fit RF
+print("Tuning Random Forest...")
+rf_search = GridSearchCV(rf_pipe, rf_grid, scoring=scorer, cv=cv, n_jobs=1, verbose=1)
+rf_search.fit(train_df[num_cols + cat_cols], train_df['loan_paid_back'])
+print("RF best params:", rf_search.best_params_, "best CV AUC:", rf_search.best_score_)
+
+# Evaluate on test set
+best_lr = lr_search.best_estimator_
+best_rf = rf_search.best_estimator_
+
+lr_probs = best_lr.predict_proba(test_df[num_cols + cat_cols])[:,1]
+rf_probs = best_rf.predict_proba(test_df[num_cols + cat_cols])[:,1]
+
+lr_auc = roc_auc_score(test_df['loan_paid_back'], lr_probs)
+rf_auc = roc_auc_score(test_df['loan_paid_back'], rf_probs)
+print(f"Test ROC AUC - LogisticRegression: {lr_auc:.4f}, RandomForest: {rf_auc:.4f}")
+
+# Choose the best single architecture
+if lr_auc >= rf_auc:
+    best_model = best_lr
+    best_probs = lr_probs
+    chosen_name = "LogisticRegression"
+    chosen_auc = lr_auc
+else:
+    best_model = best_rf
+    best_probs = rf_probs
+    chosen_name = "RandomForest"
+    chosen_auc = rf_auc
+
+print("Chosen model:", chosen_name, "Test AUC:", chosen_auc)
+
+# Save test predictions (probabilities)
+preds_out = test_df.copy().reset_index(drop=True)
+preds_out['pred_proba'] = best_probs
+out_path = "/content/loan_test_predictions.csv"
+preds_out.to_csv(out_path, index=False)
+print("Saved test predictions to:", out_path)
+
+# Plot ROC curve for chosen model
+fpr, tpr, thr = roc_curve(test_df['loan_paid_back'], best_probs)
+plt.figure(figsize=(6,6))
+plt.plot(fpr, tpr, label=f'{chosen_name} (AUC={chosen_auc:.3f})')
+plt.plot([0,1],[0,1],'k--', alpha=0.4)
+plt.xlabel('False Positive Rate'); plt.ylabel('True Positive Rate'); plt.title('ROC Curve'); plt.legend(); plt.grid(); plt.show()
+
+# ---------------- Subgroup analysis (AUC) ----------------
+from sklearn.metrics import roc_auc_score
+
+# 1) By education_level: report AUC for each level present
+if 'education_level' in test_df.columns:
+    edu_levels = test_df['education_level'].fillna('MISSING').unique()
+    edu_rows = []
+    for lvl in edu_levels:
+        mask = test_df['education_level'].fillna('MISSING') == lvl
+        # need at least one positive and one negative to compute AUC
+        y_true = test_df.loc[mask, 'loan_paid_back']
+        y_score = preds_out.loc[mask, 'pred_proba']
+        if y_true.nunique() < 2 or len(y_true) < 10:
+            auc_val = np.nan
+        else:
+            auc_val = roc_auc_score(y_true, y_score)
+        edu_rows.append({'education_level': lvl, 'n': int(mask.sum()), 'AUC': auc_val})
+    edu_df = pd.DataFrame(edu_rows).sort_values('AUC', ascending=False)
+    print("\nAUC by education_level:")
+    display(edu_df)
+else:
+    print("Column 'education_level' not found in data; skipping education subgroup analysis.")
+
+# 2) By loan_purpose: compute AUC per purpose, then show top 3 and bottom 3 (with min size)
+if 'loan_purpose' in test_df.columns:
+    purpose_vals = test_df['loan_purpose'].fillna('MISSING').unique()
+    purpose_rows = []
+    for p in purpose_vals:
+        mask = test_df['loan_purpose'].fillna('MISSING') == p
+        y_true = test_df.loc[mask, 'loan_paid_back']
+        y_score = preds_out.loc[mask, 'pred_proba']
+        if y_true.nunique() < 2 or mask.sum() < MIN_GROUP_SIZE:
+            auc_val = np.nan
+        else:
+            auc_val = roc_auc_score(y_true, y_score)
+        purpose_rows.append({'loan_purpose': p, 'n': int(mask.sum()), 'AUC': auc_val})
+    purpose_df = pd.DataFrame(purpose_rows).sort_values('AUC', ascending=False)
+    print("\nLoan purpose AUC (only purposes with >= {} samples considered for ranking):".format(MIN_GROUP_SIZE))
+    display(purpose_df)
+
+    # top 3 and bottom 3 (filter out NaNs)
+    purpose_valid = purpose_df.dropna(subset=['AUC'])
+    top3 = purpose_valid.head(3)
+    bottom3 = purpose_valid.tail(3)
+    print("\nTop 3 loan purposes by AUC:")
+    display(top3)
+    print("\nBottom 3 loan purposes by AUC:")
+    display(bottom3)
+else:
+    print("Column 'loan_purpose' not found in data; skipping purpose subgroup analysis.")
+
+# ---------------- Print final summary ----------------
+print("\n--- FINAL SUMMARY ---")
+print("Chosen model:", chosen_name)
+print("Test ROC AUC (chosen): {:.4f}".format(chosen_auc))
+print("Predictions saved to:", out_path)
+
+# Optionally display feature importance / coefficients for explainability
+if chosen_name == "LogisticRegression":
+    # extract pipeline feature names
+    pre = best_model.named_steps['preproc']
+    # numeric names
+    num_features = num_cols
+    # categorical OHE feature names
+    ohe_step = pre.named_transformers_['cat'].named_steps['onehot']
+    try:
+        cat_feature_names = ohe_step.get_feature_names_out(cat_cols).tolist()
+    except:
+        # older scikit-learn name
+        cat_feature_names = ohe_step.get_feature_names(cat_cols).tolist()
+    feature_names = num_features + cat_feature_names
+    coefs = best_model.named_steps['clf'].coef_[0]
+    coef_df = pd.DataFrame({'feature': feature_names, 'coef': coefs}).sort_values('coef', ascending=False)
+    print("\nTop positive coefficients (increase probability of paid back):")
+    display(coef_df.head(10))
+    print("\nTop negative coefficients:")
+    display(coef_df.tail(10))
+else:
+    pre = best_model.named_steps['preproc']
+    num_features = num_cols
+    ohe_step = pre.named_transformers_['cat'].named_steps['onehot']
+    try:
+        cat_feature_names = ohe_step.get_feature_names_out(cat_cols).tolist()
+    except:
+        cat_feature_names = ohe_step.get_feature_names(cat_cols).tolist()
+    feat_names = num_features + cat_feature_names
+    importances = best_model.named_steps['clf'].feature_importances_
+    fi_df = pd.DataFrame({'feature': feat_names, 'importance': importances}).sort_values('importance', ascending=False)
+    print("\nTop feature importances:")
+    display(fi_df.head(15))
